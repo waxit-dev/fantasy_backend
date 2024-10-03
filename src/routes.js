@@ -12,5 +12,7 @@ router.get('/teams', controllers.getAllTeams);
 router.get('/teams/:slug', controllers.getTeamById);
 router.post('/teams', controllers.createTeam);
 
+router.post('/register', controllers.createTeam);
+
 module.exports = router;
 
