@@ -43,7 +43,7 @@ const getTeamById = async (req, res) => {
 };
 
 const purchasePlayer = async (req, res) => {
-    const { teamId, playerId } = req.body;
+    const { teamId, playerId, position } = req.body; // Only need teamId, playerId, and position
 
     try {
         // Get team details and check the current cash balance
@@ -76,15 +76,47 @@ const purchasePlayer = async (req, res) => {
         const updateTeamCashQuery = `UPDATE teams SET cash = $1 WHERE id = $2`;
         await db.query(updateTeamCashQuery, [newCashBalance, teamId]);
 
-        // Insert the player into the team_players table
+        // Insert the player into the team_players table with all related metrics
         const insertPlayerQuery = `
-            INSERT INTO team_players (team_id, player_id)
-            VALUES ($1, $2)
+            INSERT INTO team_players (team_id, player_id, position, attendance, social, productivity, intensity, specialty_rating, overall_rating)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
         `;
-        await db.query(insertPlayerQuery, [teamId, playerId]);
+        await db.query(insertPlayerQuery, [
+            teamId,               // $1 -> team_id
+            player.id,            // $2 -> player_id
+            position,             // $3 -> position (from the request body)
+            player.attendance,    // $4 -> attendance
+            player.social,        // $5 -> social
+            player.productivity,  // $6 -> productivity
+            player.intensity,     // $7 -> intensity
+            player.specialty_rating, // $8 -> specialty_rating
+            player.overall_rating // $9 -> overall_rating
+        ]);
+
+        // Get the updated team details
+        const updatedTeamQuery = `SELECT * FROM teams WHERE id = $1`;
+        const updatedTeamResult = await db.query(updatedTeamQuery, [teamId]);
+        const updatedTeam = updatedTeamResult.rows[0];
+
+        // Get all players associated with the team
+        const teamPlayersQuery = `
+            SELECT players.id, players.name, team_players.position, team_players.attendance, team_players.social,
+                   team_players.productivity, team_players.intensity, team_players.specialty_rating, team_players.overall_rating
+            FROM players
+            INNER JOIN team_players ON players.id = team_players.player_id
+            WHERE team_players.team_id = $1
+        `;
+        const teamPlayersResult = await db.query(teamPlayersQuery, [teamId]);
+        const teamPlayers = teamPlayersResult.rows;
+
+        // Respond with the updated team and associated players
+        res.status(201).json({
+            userTeam: updatedTeam,
+            teamPlayers: teamPlayers
+        });
 
         // Respond with success message and updated team cash balance
-        res.status(201).json({ message: 'Player purchased successfully', cash: newCashBalance });
+        //res.status(201).json({ message: 'Player purchased successfully.', cash: newCashBalance });
     } catch (error) {
         console.error('Error purchasing player:', error);
         res.status(500).json({ message: 'Error processing the purchase' });
