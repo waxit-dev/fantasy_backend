@@ -33,14 +33,41 @@ const getAllTeams = async (req, res) => {
 };
 
 const getTeamById = async (req, res) => {
+    const { id } = req.params; // Team ID from URL params
+
     try {
-        const result = await db.query('SELECT * FROM team_players WHERE team_id = ${req.body.team_id');
-        res.json(result.rows);
-    } catch (err) {
-        console.error(err);
-        res.status(500).json({ error: 'Could not get players from db.' });
+        // Get team details
+        const findTeamQuery = `SELECT * FROM teams WHERE id = $1`;
+        const teamResult = await db.query(findTeamQuery, [id]);
+
+        if (teamResult.rows.length === 0) {
+            return res.status(400).json({ message: 'Team not found' });
+        }
+
+        const userTeam = teamResult.rows[0];
+
+        // Get all players associated with the team
+        const teamPlayersQuery = `
+            SELECT players.id, players.name, team_players.position, team_players.attendance, team_players.social,
+                   team_players.productivity, team_players.intensity, team_players.specialty_rating, team_players.overall_rating
+            FROM players
+            INNER JOIN team_players ON players.id = team_players.player_id
+            WHERE team_players.team_id = $1
+        `;
+        const teamPlayersResult = await db.query(teamPlayersQuery, [id]);
+        const userPlayers = teamPlayersResult.rows;
+
+        // Respond with the team and its players
+        res.status(200).json({
+            userTeam: userTeam,
+            userPlayers: userPlayers
+        });
+    } catch (error) {
+        console.error('Error retrieving team:', error);
+        res.status(500).json({ message: 'Error retrieving team information' });
     }
 };
+
 
 const purchasePlayer = async (req, res) => {
     const { teamId, playerId, position } = req.body; // Only need teamId, playerId, and position

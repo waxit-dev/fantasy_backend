@@ -10,7 +10,7 @@ router.post('/players/purchase', controllers.purchasePlayer);
 
 // Team routes
 router.get('/teams', controllers.getAllTeams);
-router.get('/teams/:slug', controllers.getTeamById);
+router.get('/teams/:id', controllers.getTeamById);
 router.post('/teams', controllers.createTeam);
 
 router.post('/register', controllers.createTeam);
