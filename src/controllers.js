@@ -18,6 +18,58 @@ const getPlayerById = (req, res) => {
 
 };
 
+const updatePlayerAttributeByPosition = async (req, res) => {
+    const { playerId, attribute, position } = req.body;
+
+    try {
+        // Validate the attribute is one of the allowed fields
+        const validAttributes = ['attendance', 'social', 'productivity', 'intensity', 'specialty_rating'];
+        if (!validAttributes.includes(attribute)) {
+            return res.status(400).json({ message: 'Invalid attribute to update' });
+        }
+
+        // Find all players in the specified position
+        const findPlayersQuery = `
+            SELECT * FROM team_players WHERE position = $1
+        `;
+        const playersResult = await db.query(findPlayersQuery, [position]);
+
+        if (playersResult.rows.length === 0) {
+            return res.status(400).json({ message: 'No players found for this position' });
+        }
+
+        // Loop through players and update their attributes and overall rating
+        const updatePromises = playersResult.rows.map(async (player) => {
+            const newAttributeValue = player[attribute] + 5;
+
+            // Recalculate the overall rating based on the updated attributes
+            const overallRating = (
+                (player.attendance + player.social + player.productivity + player.intensity + player.specialty_rating) / 500
+            ) * 100;
+
+            // Update both the specified attribute and overall_rating
+            const updatePlayerQuery = `
+                UPDATE team_players
+                SET ${attribute} = $1, overall_rating = $2
+                WHERE player_id = $3 AND position = $4
+            `;
+            return db.query(updatePlayerQuery, [newAttributeValue, overallRating, player.player_id, position]);
+        });
+
+        await Promise.all(updatePromises);
+
+        // Fetch the updated players for the response
+        const updatedPlayersQuery = `SELECT * FROM team_players WHERE position = $1`;
+        const updatedPlayersResult = await db.query(updatedPlayersQuery, [position]);
+
+        // Respond with success and the updated players in the specified position
+        res.status(200).json({ message: 'Player attributes and overall rating updated successfully', updatedPlayers: updatedPlayersResult.rows });
+    } catch (error) {
+        console.error('Error updating player attributes:', error);
+        res.status(500).json({ message: 'Error updating player attributes' });
+    }
+};
+
 const createPlayer = (req, res) => {
 
 };
@@ -246,6 +298,7 @@ const createTeam = async (req, res) => {
 module.exports = {
   getAllPlayers,
   getPlayerById,
+  updatePlayerAttributeByPosition,
   createPlayer,
   getAllTeams,
   getTeamById,
