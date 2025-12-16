@@ -396,23 +396,23 @@ const convertAttributePointsToAttributes = async (teamId) => {
             let needsUpdate = false;
             const updates = [];
 
-            // Check each attribute and convert points if >= 25
+            // Check each attribute and convert points if >= 25 (specialty uses 10)
             const attributes = [
-                { points: 'attendance_points', attr: 'attendance', currentAttr: 'attendance' },
-                { points: 'social_points', attr: 'social', currentAttr: 'social' },
-                { points: 'productivity_points', attr: 'productivity', currentAttr: 'productivity' },
-                { points: 'intensity_points', attr: 'intensity', currentAttr: 'intensity' },
-                { points: 'specialist_points', attr: 'specialty_rating', currentAttr: 'specialty_rating' }
+                { points: 'attendance_points', attr: 'attendance', currentAttr: 'attendance', threshold: 25 },
+                { points: 'social_points', attr: 'social', currentAttr: 'social', threshold: 25 },
+                { points: 'productivity_points', attr: 'productivity', currentAttr: 'productivity', threshold: 25 },
+                { points: 'intensity_points', attr: 'intensity', currentAttr: 'intensity', threshold: 25 },
+                { points: 'specialist_points', attr: 'specialty_rating', currentAttr: 'specialty_rating', threshold: 10 } // Specialty uses 10 points = 0.01
             ];
 
-            for (const { points, attr, currentAttr } of attributes) {
+            for (const { points, attr, currentAttr, threshold } of attributes) {
                 const currentPoints = parseFloat(player[points]) || 0;
                 
-                if (currentPoints >= 25) {
-                    // Calculate how many full conversions (25 points each)
-                    const conversions = Math.floor(currentPoints / 25);
+                if (currentPoints >= threshold) {
+                    // Calculate how many full conversions
+                    const conversions = Math.floor(currentPoints / threshold);
                     const attributeIncrease = conversions * 0.01;
-                    const remainingPoints = currentPoints - (conversions * 25);
+                    const remainingPoints = currentPoints - (conversions * threshold);
 
                     // Update attribute (capped at 99)
                     const newAttributeValue = Math.min(99, parseFloat(player[currentAttr]) + attributeIncrease);
@@ -463,6 +463,111 @@ const convertAttributePointsToAttributes = async (teamId) => {
 };
 
 /**
+ * Award specialty points to players whose specialty matches the task item specialty
+ * taskItems: Array of { itemId, specialty, specialtyPoints }
+ */
+const awardSpecialtyPoints = async (teamId, taskItems, taskCompletionId) => {
+    try {
+        // Get all players on the team with their specialties
+        const playersQuery = `
+            SELECT tp.player_id, p.specialty
+            FROM team_players tp
+            INNER JOIN players p ON tp.player_id = p.id
+            WHERE tp.team_id = $1
+        `;
+        const playersResult = await db.query(playersQuery, [teamId]);
+
+        if (playersResult.rows.length === 0) {
+            return; // No players on team
+        }
+
+        // Create a map of player specialties (normalized to lowercase for matching)
+        const playerSpecialties = {};
+        playersResult.rows.forEach(row => {
+            playerSpecialties[row.player_id] = row.specialty?.toLowerCase().trim();
+        });
+
+        // Process each task item that has a specialty
+        for (const taskItem of taskItems) {
+            const { itemId, specialty, specialtyPoints } = taskItem;
+            
+            if (!specialty || !specialtyPoints || specialtyPoints <= 0) {
+                continue; // Skip items without specialties or points
+            }
+
+            const taskSpecialty = specialty.toLowerCase().trim();
+
+            // Award points to players whose specialty matches
+            for (const playerId in playerSpecialties) {
+                const playerSpecialty = playerSpecialties[playerId];
+                
+                // Match specialty (case-insensitive, flexible matching)
+                // Check if player specialty contains task specialty or vice versa
+                const matches = playerSpecialty && (
+                    playerSpecialty === taskSpecialty ||
+                    playerSpecialty.includes(taskSpecialty) ||
+                    taskSpecialty.includes(playerSpecialty)
+                );
+
+                if (matches) {
+                    // Award specialty points to this player
+                    const updateQuery = `
+                        UPDATE team_players
+                        SET specialist_points = specialist_points + $1,
+                            monthly_points_earned = monthly_points_earned + $1
+                        WHERE player_id = $2 AND team_id = $3
+                    `;
+                    await db.query(updateQuery, [specialtyPoints, parseInt(playerId), teamId]);
+
+                    // Record in task_player_assignments for tracking
+                    const insertQuery = `
+                        INSERT INTO task_player_assignments 
+                        (task_completion_id, player_id, team_id, task_item_id, points_earned)
+                        VALUES ($1, $2, $3, $4, $5)
+                        ON CONFLICT DO NOTHING
+                    `;
+                    await db.query(insertQuery, [
+                        taskCompletionId,
+                        parseInt(playerId),
+                        teamId,
+                        itemId,
+                        specialtyPoints
+                    ]);
+                }
+            }
+        }
+
+        // After awarding all specialty points, convert points to attributes (10 points = 0.01 for specialty)
+        await convertAttributePointsToAttributes(teamId);
+    } catch (error) {
+        console.error('Error awarding specialty points:', error);
+        throw error;
+    }
+};
+
+/**
+ * Award overall task productivity bonus to all players on the team
+ */
+const awardTaskProductivityBonus = async (teamId, bonusPoints) => {
+    try {
+        // Award productivity points to all players on the team
+        const updateQuery = `
+            UPDATE team_players
+            SET productivity_points = productivity_points + $1,
+                monthly_points_earned = monthly_points_earned + $1
+            WHERE team_id = $2
+        `;
+        await db.query(updateQuery, [bonusPoints, teamId]);
+
+        // Convert points to attributes if any player reached 25
+        await convertAttributePointsToAttributes(teamId);
+    } catch (error) {
+        console.error('Error awarding task productivity bonus:', error);
+        throw error;
+    }
+};
+
+/**
  * Process all point bonuses for a task completion
  */
 const processPointBonuses = async (taskCompletionId, teamId, completionDate, playerAssignments) => {
@@ -495,6 +600,8 @@ const processPointBonuses = async (taskCompletionId, teamId, completionDate, pla
 module.exports = {
     processPointBonuses,
     awardAttributePoints,
+    awardSpecialtyPoints,
+    awardTaskProductivityBonus,
     convertAttributePointsToAttributes,
     awardAttendanceBonus,
     awardSocialBonus,

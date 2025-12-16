@@ -513,7 +513,8 @@ const completeTaskWithPlayers = async (req, res) => {
         taskId, 
         points, 
         playerAssignments, // Array of { playerId, taskItemId, points }
-        taskItems, // Array of { itemId, attribute, attributePoints } - for attribute point awards
+        taskItems, // Array of { itemId, attribute, attributePoints, specialty, specialtyPoints } - for attribute/specialty point awards
+        taskProductivityBonus, // Overall task productivity bonus (e.g., +2 for add-product)
         taskTags, // Array of strings
         taskType // String: 'customer service', 'collaborative', etc.
     } = req.body;
@@ -587,10 +588,17 @@ const completeTaskWithPlayers = async (req, res) => {
 
         await Promise.all(assignmentPromises);
 
-        // Award attribute points to all players on the team whose attribute matches task item attributes
+        // Award attribute points and specialty points to all players on the team
         if (taskItems && taskItems.length > 0) {
-            const { awardAttributePoints } = require('./pointEarningSystem');
+            const { awardAttributePoints, awardSpecialtyPoints } = require('./pointEarningSystem');
             await awardAttributePoints(id, taskItems, taskCompletionId);
+            await awardSpecialtyPoints(id, taskItems, taskCompletionId);
+        }
+
+        // Award overall task productivity bonus if specified
+        if (taskProductivityBonus && taskProductivityBonus > 0) {
+            const { awardTaskProductivityBonus } = require('./pointEarningSystem');
+            await awardTaskProductivityBonus(id, taskProductivityBonus);
         }
 
         // Process point bonuses (attendance, social, productivity, intensity, specialist)
