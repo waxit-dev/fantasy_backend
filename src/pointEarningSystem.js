@@ -45,23 +45,17 @@ const awardAttendanceBonus = async (teamId, completionDate) => {
         
         // If team completed tasks on all 5 weekdays, award bonus
         if (result.rows.length >= 5) {
-            // Award +0.01 attendance to all players on the team
+            // Award +0.01 attendance points (will convert to attribute when reaching 25)
             const updateQuery = `
                 UPDATE team_players
-                SET attendance = LEAST(99, attendance + 0.01),
-                    attendance_points = attendance_points + 0.01,
+                SET attendance_points = attendance_points + 0.01,
                     monthly_points_earned = monthly_points_earned + 0.01
                 WHERE team_id = $1
             `;
             await db.query(updateQuery, [teamId]);
             
-            // Update overall ratings for all affected players
-            const playersQuery = `SELECT player_id FROM team_players WHERE team_id = $1`;
-            const playersResult = await db.query(playersQuery, [teamId]);
-            for (const row of playersResult.rows) {
-                await updatePlayerOverallRating(row.player_id, teamId);
-                await calculatePlayerSalary(row.player_id);
-            }
+            // Convert points to attributes if any player reached 25
+            await convertAttributePointsToAttributes(teamId);
         }
     } catch (error) {
         console.error('Error awarding attendance bonus:', error);
@@ -107,15 +101,14 @@ const awardSocialBonus = async (taskCompletionId, playerId, teamId) => {
         if (usageCount >= 4) {
             const updateQuery = `
                 UPDATE team_players
-                SET social = LEAST(99, social + 0.01),
-                    social_points = social_points + 0.01,
+                SET social_points = social_points + 0.01,
                     monthly_points_earned = monthly_points_earned + 0.01
                 WHERE player_id = $1 AND team_id = $2
             `;
             await db.query(updateQuery, [playerId, teamId]);
             
-            await updatePlayerOverallRating(playerId, teamId);
-            await calculatePlayerSalary(playerId);
+            // Convert points to attributes if player reached 25
+            await convertAttributePointsToAttributes(teamId);
         }
     } catch (error) {
         console.error('Error awarding social bonus:', error);
@@ -150,15 +143,14 @@ const awardProductivityBonus = async (playerId, teamId, completionDate) => {
         if (taskCount >= 2) {
             const updateQuery = `
                 UPDATE team_players
-                SET productivity = LEAST(99, productivity + 0.01),
-                    productivity_points = productivity_points + 0.01,
+                SET productivity_points = productivity_points + 0.01,
                     monthly_points_earned = monthly_points_earned + 0.01
                 WHERE player_id = $1 AND team_id = $2
             `;
             await db.query(updateQuery, [playerId, teamId]);
             
-            await updatePlayerOverallRating(playerId, teamId);
-            await calculatePlayerSalary(playerId);
+            // Convert points to attributes if player reached 25
+            await convertAttributePointsToAttributes(teamId);
         }
     } catch (error) {
         console.error('Error awarding productivity bonus:', error);
@@ -193,15 +185,14 @@ const awardIntensityBonus = async (playerId, teamId, completionDate) => {
         if (taskCount >= 5) {
             const updateQuery = `
                 UPDATE team_players
-                SET intensity = LEAST(99, intensity + 0.02),
-                    intensity_points = intensity_points + 0.02,
+                SET intensity_points = intensity_points + 0.02,
                     monthly_points_earned = monthly_points_earned + 0.02
                 WHERE player_id = $1 AND team_id = $2
             `;
             await db.query(updateQuery, [playerId, teamId]);
             
-            await updatePlayerOverallRating(playerId, teamId);
-            await calculatePlayerSalary(playerId);
+            // Convert points to attributes if player reached 25
+            await convertAttributePointsToAttributes(teamId);
         }
     } catch (error) {
         console.error('Error awarding intensity bonus:', error);
@@ -248,18 +239,226 @@ const awardSpecialistBonus = async (playerId, teamId, taskCompletionId) => {
         if (matchesSpecialty) {
             const updateQuery = `
                 UPDATE team_players
-                SET specialty_rating = LEAST(99, specialty_rating + 0.02),
-                    specialist_points = specialist_points + 0.02,
+                SET specialist_points = specialist_points + 0.02,
                     monthly_points_earned = monthly_points_earned + 0.02
                 WHERE player_id = $1 AND team_id = $2
             `;
             await db.query(updateQuery, [playerId, teamId]);
             
-            await updatePlayerOverallRating(playerId, teamId);
-            await calculatePlayerSalary(playerId);
+            // Convert points to attributes if player reached 25
+            await convertAttributePointsToAttributes(teamId);
         }
     } catch (error) {
         console.error('Error awarding specialist bonus:', error);
+    }
+};
+
+/**
+ * Award attribute points to all players on a team whose attribute matches the task item attribute
+ * taskItems: Array of { itemId, attribute, attributePoints }
+ */
+const awardAttributePoints = async (teamId, taskItems, taskCompletionId) => {
+    try {
+        // Get all players on the team
+        const playersQuery = `SELECT player_id FROM team_players WHERE team_id = $1`;
+        const playersResult = await db.query(playersQuery, [teamId]);
+        const teamPlayerIds = playersResult.rows.map(row => row.player_id);
+
+        if (teamPlayerIds.length === 0) {
+            return; // No players on team
+        }
+
+        // Get player specialties from players table
+        const playerDetailsQuery = `
+            SELECT id, specialty 
+            FROM players 
+            WHERE id = ANY($1::int[])
+        `;
+        const playerDetailsResult = await db.query(playerDetailsQuery, [teamPlayerIds]);
+        const playerSpecialties = {};
+        playerDetailsResult.rows.forEach(row => {
+            playerSpecialties[row.id] = row.specialty?.toLowerCase();
+        });
+
+        // Process each task item that has an attribute
+        for (const taskItem of taskItems) {
+            const { itemId, attribute, attributePoints } = taskItem;
+            
+            if (!attribute || !attributePoints || attributePoints <= 0) {
+                continue; // Skip items without attributes or points
+            }
+
+            // Award points to all players whose attribute matches
+            // For 'specialist', we need to check if the player's specialty matches the task context
+            // For other attributes, we award to all players (they all have these attributes)
+            
+            if (attribute === 'specialist') {
+                // For specialist, we'd need task context to match specialties
+                // For now, we'll award to all players and let the specialist bonus system handle matching
+                // This could be enhanced later to match specific specialties
+                continue; // Skip specialist here, handled by specialist bonus system
+            }
+
+            // Award attribute points to all players on the team
+            // Map attribute names to column names (whitelist for safety)
+            let columnName, pointsColumnName;
+            switch (attribute) {
+                case 'attendance':
+                    columnName = 'attendance';
+                    pointsColumnName = 'attendance_points';
+                    break;
+                case 'social':
+                    columnName = 'social';
+                    pointsColumnName = 'social_points';
+                    break;
+                case 'productivity':
+                    columnName = 'productivity';
+                    pointsColumnName = 'productivity_points';
+                    break;
+                case 'intensity':
+                    columnName = 'intensity';
+                    pointsColumnName = 'intensity_points';
+                    break;
+                case 'specialist':
+                    columnName = 'specialty_rating';
+                    pointsColumnName = 'specialist_points';
+                    break;
+                default:
+                    console.warn(`Unknown attribute: ${attribute}`);
+                    continue;
+            }
+
+            // Only add to points column, not directly to attribute
+            // Attributes will be increased when points reach 25
+            const updateQuery = `
+                UPDATE team_players
+                SET ${pointsColumnName} = ${pointsColumnName} + $1,
+                    monthly_points_earned = monthly_points_earned + $1
+                WHERE team_id = $2
+            `;
+            await db.query(updateQuery, [attributePoints, teamId]);
+
+            // Record the attribute point awards in task_player_assignments for tracking
+            // We'll create a record for each player (even though they all get the same points)
+            const insertAttributeAssignments = teamPlayerIds.map(async (playerId) => {
+                const insertQuery = `
+                    INSERT INTO task_player_assignments 
+                    (task_completion_id, player_id, team_id, task_item_id, points_earned)
+                    VALUES ($1, $2, $3, $4, $5)
+                    ON CONFLICT DO NOTHING
+                `;
+                return db.query(insertQuery, [
+                    taskCompletionId,
+                    playerId,
+                    teamId,
+                    itemId,
+                    attributePoints
+                ]);
+            });
+            await Promise.all(insertAttributeAssignments);
+        }
+
+        // After awarding all points, convert points to attributes (25 points = +0.01 attribute)
+        await convertAttributePointsToAttributes(teamId);
+    } catch (error) {
+        console.error('Error awarding attribute points:', error);
+        throw error;
+    }
+};
+
+/**
+ * Convert attribute points to attribute increases
+ * When a player has 25+ points in an attribute, add 0.01 to that attribute
+ * and subtract 25 from the points counter
+ */
+const convertAttributePointsToAttributes = async (teamId) => {
+    try {
+        // Get all players on the team with their current attribute points
+        const playersQuery = `
+            SELECT player_id, 
+                   attendance_points, 
+                   social_points, 
+                   productivity_points, 
+                   intensity_points, 
+                   specialist_points,
+                   attendance,
+                   social,
+                   productivity,
+                   intensity,
+                   specialty_rating
+            FROM team_players
+            WHERE team_id = $1
+        `;
+        const playersResult = await db.query(playersQuery, [teamId]);
+
+        for (const player of playersResult.rows) {
+            const playerId = player.player_id;
+            let needsUpdate = false;
+            const updates = [];
+
+            // Check each attribute and convert points if >= 25
+            const attributes = [
+                { points: 'attendance_points', attr: 'attendance', currentAttr: 'attendance' },
+                { points: 'social_points', attr: 'social', currentAttr: 'social' },
+                { points: 'productivity_points', attr: 'productivity', currentAttr: 'productivity' },
+                { points: 'intensity_points', attr: 'intensity', currentAttr: 'intensity' },
+                { points: 'specialist_points', attr: 'specialty_rating', currentAttr: 'specialty_rating' }
+            ];
+
+            for (const { points, attr, currentAttr } of attributes) {
+                const currentPoints = parseFloat(player[points]) || 0;
+                
+                if (currentPoints >= 25) {
+                    // Calculate how many full conversions (25 points each)
+                    const conversions = Math.floor(currentPoints / 25);
+                    const attributeIncrease = conversions * 0.01;
+                    const remainingPoints = currentPoints - (conversions * 25);
+
+                    // Update attribute (capped at 99)
+                    const newAttributeValue = Math.min(99, parseFloat(player[currentAttr]) + attributeIncrease);
+                    
+                    updates.push({
+                        pointsColumn: points,
+                        attributeColumn: currentAttr,
+                        newPoints: remainingPoints,
+                        newAttribute: newAttributeValue
+                    });
+                    
+                    needsUpdate = true;
+                }
+            }
+
+            // Apply all updates for this player
+            if (needsUpdate) {
+                let updateQuery = 'UPDATE team_players SET ';
+                const updateParts = [];
+                const params = [];
+                let paramIndex = 1;
+
+                for (const update of updates) {
+                    updateParts.push(`${update.attributeColumn} = $${paramIndex}`);
+                    params.push(update.newAttribute);
+                    paramIndex++;
+                    
+                    updateParts.push(`${update.pointsColumn} = $${paramIndex}`);
+                    params.push(update.newPoints);
+                    paramIndex++;
+                }
+
+                updateQuery += updateParts.join(', ');
+                updateQuery += ` WHERE player_id = $${paramIndex} AND team_id = $${paramIndex + 1}`;
+                params.push(playerId, teamId);
+
+                await db.query(updateQuery, params);
+
+                // Update overall rating and salary after attribute changes
+                await updatePlayerOverallRating(playerId, teamId);
+                await calculatePlayerSalary(playerId);
+            }
+        }
+    } catch (error) {
+        console.error('Error converting attribute points to attributes:', error);
+        throw error;
     }
 };
 
@@ -295,6 +494,8 @@ const processPointBonuses = async (taskCompletionId, teamId, completionDate, pla
 
 module.exports = {
     processPointBonuses,
+    awardAttributePoints,
+    convertAttributePointsToAttributes,
     awardAttendanceBonus,
     awardSocialBonus,
     awardProductivityBonus,

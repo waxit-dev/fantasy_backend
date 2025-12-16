@@ -513,6 +513,7 @@ const completeTaskWithPlayers = async (req, res) => {
         taskId, 
         points, 
         playerAssignments, // Array of { playerId, taskItemId, points }
+        taskItems, // Array of { itemId, attribute, attributePoints } - for attribute point awards
         taskTags, // Array of strings
         taskType // String: 'customer service', 'collaborative', etc.
     } = req.body;
@@ -585,6 +586,12 @@ const completeTaskWithPlayers = async (req, res) => {
         });
 
         await Promise.all(assignmentPromises);
+
+        // Award attribute points to all players on the team whose attribute matches task item attributes
+        if (taskItems && taskItems.length > 0) {
+            const { awardAttributePoints } = require('./pointEarningSystem');
+            await awardAttributePoints(id, taskItems, taskCompletionId);
+        }
 
         // Process point bonuses (attendance, social, productivity, intensity, specialist)
         const { processPointBonuses } = require('./pointEarningSystem');
