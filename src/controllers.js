@@ -1,6 +1,7 @@
 const db = require('./db');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
+const { updatePlayerOverallRating, calculatePlayerSalary, calculateTeamScore } = require('./playerCalculations');
 
 
 // Controllers
@@ -42,18 +43,16 @@ const updatePlayerAttributeByPosition = async (req, res) => {
         const updatePromises = playersResult.rows.map(async (player) => {
             const newAttributeValue = player[attribute] + 5;
 
-            // Recalculate the overall rating based on the updated attributes
-            const overallRating = (
-                (player.attendance + player.social + player.productivity + player.intensity + player.specialty_rating) / 500
-            ) * 100;
-
-            // Update both the specified attribute and overall_rating
-            const updatePlayerQuery = `
+            // Update the attribute first
+            const updateAttributeQuery = `
                 UPDATE team_players
-                SET ${attribute} = $1, overall_rating = $2
-                WHERE player_id = $3 AND position = $4
+                SET ${attribute} = $1
+                WHERE player_id = $2 AND position = $3
             `;
-            return db.query(updatePlayerQuery, [newAttributeValue, overallRating, player.player_id, position]);
+            await db.query(updateAttributeQuery, [newAttributeValue, player.player_id, position]);
+
+            // Recalculate overall rating using new formula (mean of 5 attributes, capped at 99)
+            await updatePlayerOverallRating(player.player_id, player.team_id);
         });
 
         await Promise.all(updatePromises);
@@ -80,9 +79,12 @@ const getAllTeams = async (req, res) => {
         const teamsResult = await db.query('SELECT * FROM teams ORDER BY id');
         const teams = teamsResult.rows;
 
-        // For each team, calculate leaderboard score
+        // For each team, calculate leaderboard score using new formula
         const teamsWithScores = await Promise.all(teams.map(async (team) => {
-            // Get average overall rating of team players
+            // Calculate team score using new weighted formula
+            const teamScore = await calculateTeamScore(team.id);
+
+            // Get average overall rating for display
             const avgRatingQuery = `
                 SELECT COALESCE(AVG(overall_rating), 0) as avg_rating
                 FROM team_players
@@ -91,19 +93,9 @@ const getAllTeams = async (req, res) => {
             const avgRatingResult = await db.query(avgRatingQuery, [team.id]);
             const avgRating = parseFloat(avgRatingResult.rows[0].avg_rating) || 0;
 
-            // Calculate leaderboard score: total_points + (avg_rating * 0.25)
-            const totalPoints = parseFloat(team.total_points) || 0;
-            const leaderboardScore = totalPoints + (avgRating * 0.25);
-
-            // Update the leaderboard_score in the database
-            await db.query(
-                'UPDATE teams SET leaderboard_score = $1 WHERE id = $2',
-                [leaderboardScore, team.id]
-            );
-
             return {
                 ...team,
-                leaderboard_score: leaderboardScore,
+                leaderboard_score: teamScore || 0,
                 avg_team_rating: avgRating
             };
         }));
@@ -235,11 +227,12 @@ const purchasePlayer = async (req, res) => {
             player.overall_rating // $9 -> overall_rating
         ]);
 
-        // Increase player's salary by $5000 after purchase
-        const newPlayerSalary = playerSalary + 5000;
-        const updatePlayerSalaryQuery = `UPDATE players SET salary = $1::numeric WHERE id = $2`;
-        await db.query(updatePlayerSalaryQuery, [newPlayerSalary, playerId]);
-        console.log(`Player salary increased: ${playerSalary} -> ${newPlayerSalary}`);
+        // Recalculate player's salary using dynamic formula (base + demand + performance)
+        const newPlayerSalary = await calculatePlayerSalary(playerId);
+        console.log(`Player salary recalculated: ${playerSalary} -> ${newPlayerSalary}`);
+        
+        // Update team score after purchase
+        await calculateTeamScore(teamId);
 
         // Get the updated team details
         const updatedTeamQuery = `SELECT * FROM teams WHERE id = $1`;
@@ -321,6 +314,12 @@ const sellPlayer = async (req, res) => {
             WHERE team_id = $1 AND player_id = $2
         `;
         await db.query(deleteTeamPlayerQuery, [teamId, playerId]);
+        
+        // Recalculate player's salary (demand will decrease)
+        await calculatePlayerSalary(playerId);
+        
+        // Update team score after sale
+        await calculateTeamScore(teamId);
 
         // Get the updated team details
         const updatedTeamQuery = `SELECT * FROM teams WHERE id = $1`;
@@ -493,6 +492,9 @@ const updateTeamTaskPoints = async (req, res) => {
 
         const updatedTeam = updateResult.rows[0];
 
+        // Recalculate team score
+        await calculateTeamScore(id);
+
         // Respond with the updated team data
         res.status(200).json({
             message: 'Team points updated successfully',
@@ -502,6 +504,134 @@ const updateTeamTaskPoints = async (req, res) => {
     } catch (error) {
         console.error('Error updating team task points:', error);
         res.status(500).json({ message: 'Error updating team task points' });
+    }
+};
+
+const completeTaskWithPlayers = async (req, res) => {
+    const { id } = req.params; // Team ID
+    const { 
+        taskId, 
+        points, 
+        playerAssignments, // Array of { playerId, taskItemId, points }
+        taskTags, // Array of strings
+        taskType // String: 'customer service', 'collaborative', etc.
+    } = req.body;
+
+    try {
+        // Validate inputs
+        if (typeof points !== 'number' || points < 0) {
+            return res.status(400).json({ message: 'Invalid points value.' });
+        }
+
+        if (!taskId) {
+            return res.status(400).json({ message: 'Task ID is required.' });
+        }
+
+        // Get team data
+        const findTeamQuery = `SELECT * FROM teams WHERE id = $1`;
+        const teamResult = await db.query(findTeamQuery, [id]);
+
+        if (teamResult.rows.length === 0) {
+            return res.status(400).json({ message: 'Team not found' });
+        }
+
+        const completionDate = new Date();
+
+        // Create task completion record
+        const insertTaskCompletionQuery = `
+            INSERT INTO task_completions (task_id, team_id, completed_at, task_tags, task_type, points_awarded)
+            VALUES ($1, $2, $3, $4, $5, $6)
+            RETURNING id
+        `;
+        const taskCompletionResult = await db.query(insertTaskCompletionQuery, [
+            taskId,
+            id,
+            completionDate,
+            taskTags || [],
+            taskType || null,
+            points
+        ]);
+
+        const taskCompletionId = taskCompletionResult.rows[0].id;
+
+        // Create player assignments
+        const assignmentPromises = (playerAssignments || []).map(async (assignment) => {
+            const { playerId, taskItemId, points: itemPoints } = assignment;
+            
+            // Verify player is on the team
+            const checkPlayerQuery = `
+                SELECT * FROM team_players 
+                WHERE player_id = $1 AND team_id = $2
+            `;
+            const playerCheck = await db.query(checkPlayerQuery, [playerId, id]);
+            
+            if (playerCheck.rows.length === 0) {
+                console.warn(`Player ${playerId} not found on team ${id}`);
+                return;
+            }
+
+            const insertAssignmentQuery = `
+                INSERT INTO task_player_assignments 
+                (task_completion_id, player_id, team_id, task_item_id, points_earned)
+                VALUES ($1, $2, $3, $4, $5)
+            `;
+            return db.query(insertAssignmentQuery, [
+                taskCompletionId,
+                playerId,
+                id,
+                taskItemId,
+                itemPoints || 0
+            ]);
+        });
+
+        await Promise.all(assignmentPromises);
+
+        // Process point bonuses (attendance, social, productivity, intensity, specialist)
+        const { processPointBonuses } = require('./pointEarningSystem');
+        await processPointBonuses(
+            taskCompletionId,
+            id,
+            completionDate,
+            playerAssignments || []
+        );
+
+        // Update team points
+        const team = teamResult.rows[0];
+        const currentTaskPoints = parseFloat(team.task_points || 0);
+        const currentTotalPoints = parseFloat(team.total_points || 0);
+        const currentWeeklyPoints = parseFloat(team.weekly_points || 0);
+
+        const newTaskPoints = currentTaskPoints + points;
+        const newTotalPoints = currentTotalPoints + points;
+        const newWeeklyPoints = currentWeeklyPoints + points;
+
+        const updateTeamQuery = `
+            UPDATE teams 
+            SET task_points = $1::numeric, 
+                total_points = $2::numeric, 
+                weekly_points = $3::numeric
+            WHERE id = $4
+            RETURNING id, name, slug, cash, total_points, weekly_points, task_points
+        `;
+        const updateResult = await db.query(updateTeamQuery, [
+            newTaskPoints,
+            newTotalPoints,
+            newWeeklyPoints,
+            id
+        ]);
+
+        // Recalculate team score
+        await calculateTeamScore(id);
+
+        res.status(200).json({
+            message: 'Task completed successfully with player assignments',
+            team: updateResult.rows[0],
+            taskCompletionId,
+            pointsAdded: points
+        });
+    } catch (error) {
+        console.error('Error completing task with players:', error);
+        res.status(500).json({ message: 'Error completing task' });
     }
 };
 
@@ -517,6 +647,7 @@ module.exports = {
   purchasePlayer,
   sellPlayer,
   loginTeam,
-  updateTeamTaskPoints
+  updateTeamTaskPoints,
+  completeTaskWithPlayers
 };
 

@@ -16,6 +16,7 @@ router.get('/teams', controllers.getAllTeams);
 router.get('/teams/:id', controllers.getTeamById);
 router.post('/teams', controllers.createTeam);
 router.post('/teams/:id/tasks/complete', controllers.updateTeamTaskPoints);
+router.post('/teams/:id/tasks/complete-with-players', controllers.completeTaskWithPlayers);
 
 router.post('/register', controllers.createTeam);
 router.post('/login', controllers.loginTeam);
