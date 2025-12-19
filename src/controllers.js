@@ -3,6 +3,7 @@ const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const { updatePlayerOverallRating, calculatePlayerSalary, calculateTeamScore } = require('./playerCalculations');
 const { getPlayerValuation, getPlayerTransactionHistory, getMarketAnalytics } = require('./playerValuation');
+const { getCurrentSeason, getAllSeasons, calculateTimeRemaining, checkAndCompleteSeasons, getSeasonSnapshot, getTeamNotifications, getGlobalNotifications } = require('./seasonUtils');
 
 
 // Controllers
@@ -81,6 +82,14 @@ const createPlayer = (req, res) => {
 
 const getAllTeams = async (req, res) => {
      try {
+        // Automatically check and complete expired seasons when leaderboard is accessed
+        try {
+            await checkAndCompleteSeasons();
+        } catch (seasonError) {
+            console.error('Error checking seasons (non-fatal):', seasonError);
+            // Continue even if season check fails
+        }
+        
         // Get all teams
         const teamsResult = await db.query('SELECT * FROM teams ORDER BY id');
         const teams = teamsResult.rows;
@@ -593,7 +602,8 @@ const completeTaskWithPlayers = async (req, res) => {
         taskItems, // Array of { itemId, attribute, attributePoints, specialty, specialtyPoints } - for attribute/specialty point awards
         taskProductivityBonus, // Overall task productivity bonus (e.g., +2 for add-product)
         taskTags, // Array of strings
-        taskType // String: 'customer service', 'collaborative', etc.
+        taskType, // String: 'customer service', 'collaborative', etc.
+        taskCategory // String: 'warehouse' or 'office'
     } = req.body;
 
     try {
@@ -618,8 +628,8 @@ const completeTaskWithPlayers = async (req, res) => {
 
         // Create task completion record
         const insertTaskCompletionQuery = `
-            INSERT INTO task_completions (task_id, team_id, completed_at, task_tags, task_type, points_awarded)
-            VALUES ($1, $2, $3, $4, $5, $6)
+            INSERT INTO task_completions (task_id, team_id, completed_at, task_tags, task_type, task_category, points_awarded)
+            VALUES ($1, $2, $3, $4, $5, $6, $7)
             RETURNING id
         `;
         const taskCompletionResult = await db.query(insertTaskCompletionQuery, [
@@ -628,6 +638,7 @@ const completeTaskWithPlayers = async (req, res) => {
             completionDate,
             taskTags || [],
             taskType || null,
+            taskCategory || null,
             points
         ]);
 
@@ -676,6 +687,18 @@ const completeTaskWithPlayers = async (req, res) => {
         if (taskProductivityBonus && taskProductivityBonus > 0) {
             const { awardTaskProductivityBonus } = require('./pointEarningSystem');
             await awardTaskProductivityBonus(id, taskProductivityBonus, playerAssignments || []);
+        }
+
+        // Award intensity points to Office role players if this is an Office task
+        if (taskCategory === 'office' && playerAssignments && playerAssignments.length > 0) {
+            const { awardOfficeTaskIntensityBonus } = require('./pointEarningSystem');
+            await awardOfficeTaskIntensityBonus(id, playerAssignments || []);
+        }
+
+        // Award intensity points to Warehouse role players if this is a Warehouse task
+        if (taskCategory === 'warehouse' && playerAssignments && playerAssignments.length > 0) {
+            const { awardWarehouseTaskIntensityBonus } = require('./pointEarningSystem');
+            await awardWarehouseTaskIntensityBonus(id, playerAssignments || []);
         }
 
         // Process point bonuses (attendance, social, productivity, intensity, specialist)
@@ -1118,6 +1141,179 @@ const getTaskDisputes = async (req, res) => {
     }
 };
 
+const getCurrentSeasonInfo = async (req, res) => {
+    try {
+        const currentSeason = await getCurrentSeason();
+        
+        if (!currentSeason) {
+            return res.status(200).json({
+                hasActiveSeason: false,
+                message: 'No active season found'
+            });
+        }
+        
+        const timeRemaining = calculateTimeRemaining(currentSeason.end_date);
+        
+        res.status(200).json({
+            hasActiveSeason: true,
+            season: {
+                id: currentSeason.id,
+                seasonNumber: currentSeason.season_number,
+                startDate: currentSeason.start_date,
+                endDate: currentSeason.end_date,
+                status: currentSeason.status
+            },
+            timeRemaining: {
+                days: timeRemaining.days,
+                hours: timeRemaining.hours,
+                minutes: timeRemaining.minutes,
+                seconds: timeRemaining.seconds,
+                isExpired: timeRemaining.isExpired,
+                formatted: `${timeRemaining.days}d ${timeRemaining.hours}h ${timeRemaining.minutes}m ${timeRemaining.seconds}s`
+            }
+        });
+    } catch (error) {
+        console.error('Error getting current season info:', error);
+        res.status(500).json({ message: 'Error retrieving season information' });
+    }
+};
+
+const getAllSeasonsHistory = async (req, res) => {
+    try {
+        const seasons = await getAllSeasons();
+        
+        res.status(200).json({
+            seasons: seasons.map(season => ({
+                id: season.id,
+                seasonNumber: season.season_number,
+                startDate: season.start_date,
+                endDate: season.end_date,
+                status: season.status,
+                winnerTeamId: season.winner_team_id,
+                winnerTeamName: season.winner_team_name,
+                winnerScore: season.winner_leaderboard_score ? parseFloat(season.winner_leaderboard_score) : null,
+                completedAt: season.completed_at
+            }))
+        });
+    } catch (error) {
+        console.error('Error getting seasons history:', error);
+        res.status(500).json({ message: 'Error retrieving seasons history' });
+    }
+};
+
+const completeExpiredSeasons = async (req, res) => {
+    try {
+        // Check and complete any expired seasons
+        const completed = await checkAndCompleteSeasons();
+        
+        res.status(200).json({
+            message: 'Season check completed',
+            completedSeasons: completed
+        });
+    } catch (error) {
+        console.error('Error completing expired seasons:', error);
+        res.status(500).json({ message: 'Error completing expired seasons' });
+    }
+};
+
+const getSeasonSnapshotData = async (req, res) => {
+    try {
+        const { seasonId } = req.params;
+        const snapshot = await getSeasonSnapshot(parseInt(seasonId));
+        
+        res.status(200).json({
+            seasonId: parseInt(seasonId),
+            snapshot: snapshot.map(entry => ({
+                position: entry.position,
+                teamId: entry.team_id,
+                teamName: entry.team_name,
+                leaderboardScore: parseFloat(entry.leaderboard_score) || 0,
+                totalPoints: parseFloat(entry.total_points) || 0,
+                weeklyPoints: parseFloat(entry.weekly_points) || 0,
+                avgTeamRating: parseFloat(entry.avg_team_rating) || 0,
+                snapshotDate: entry.snapshot_date
+            }))
+        });
+    } catch (error) {
+        console.error('Error getting season snapshot:', error);
+        res.status(500).json({ message: 'Error retrieving season snapshot' });
+    }
+};
+
+const getTeamNotificationsData = async (req, res) => {
+    try {
+        const { teamId } = req.params;
+        const { unreadOnly } = req.query;
+        
+        const notifications = await getTeamNotifications(
+            parseInt(teamId),
+            unreadOnly === 'true'
+        );
+        
+        res.status(200).json({
+            teamId: parseInt(teamId),
+            notifications: notifications.map(notif => ({
+                id: notif.id,
+                type: notif.notification_type,
+                title: notif.title,
+                message: notif.message,
+                createdAt: notif.created_at,
+                isRead: notif.is_read
+            }))
+        });
+    } catch (error) {
+        console.error('Error getting team notifications:', error);
+        res.status(500).json({ message: 'Error retrieving notifications' });
+    }
+};
+
+const getGlobalNotificationsData = async (req, res) => {
+    try {
+        const { limit } = req.query;
+        const notifications = await getGlobalNotifications(limit ? parseInt(limit) : 20);
+        
+        res.status(200).json({
+            notifications: notifications.map(notif => ({
+                id: notif.id,
+                seasonId: notif.season_id,
+                type: notif.notification_type,
+                title: notif.title,
+                message: notif.message,
+                createdAt: notif.created_at
+            }))
+        });
+    } catch (error) {
+        console.error('Error getting global notifications:', error);
+        res.status(500).json({ message: 'Error retrieving notifications' });
+    }
+};
+
+const markNotificationAsRead = async (req, res) => {
+    try {
+        const { notificationId } = req.params;
+        
+        const updateQuery = `
+            UPDATE team_notifications 
+            SET is_read = TRUE 
+            WHERE id = $1
+            RETURNING *
+        `;
+        const result = await db.query(updateQuery, [notificationId]);
+        
+        if (result.rows.length === 0) {
+            return res.status(404).json({ message: 'Notification not found' });
+        }
+        
+        res.status(200).json({
+            message: 'Notification marked as read',
+            notification: result.rows[0]
+        });
+    } catch (error) {
+        console.error('Error marking notification as read:', error);
+        res.status(500).json({ message: 'Error updating notification' });
+    }
+};
+
 // Utility endpoint to sync all player attributes from team_players to players table
 const syncAllPlayerAttributes = async (req, res) => {
     try {
@@ -1169,6 +1365,13 @@ module.exports = {
   getTaskLogs,
   disputeTaskCompletion,
   getTaskDisputes,
+  getCurrentSeasonInfo,
+  getAllSeasonsHistory,
+  completeExpiredSeasons,
+  getSeasonSnapshotData,
+  getTeamNotificationsData,
+  getGlobalNotificationsData,
+  markNotificationAsRead,
   syncAllPlayerAttributes,
   recalculateAllPlayerOverallRatings: async (req, res) => {
     try {

@@ -15,50 +15,38 @@ const isWeekdayAEDT = (date) => {
 };
 
 /**
- * Award attendance bonus: +0.01 attendance for all players in a team
- * if the team completes a task on each day Monday to Friday (AEDT)
+ * Award attendance bonus: +2 attendance_points for each player assigned to a task within the day
  */
-const awardAttendanceBonus = async (teamId, completionDate) => {
-    if (!isWeekdayAEDT(completionDate)) {
-        return; // Not a weekday in AEDT
-    }
-
+const awardAttendanceBonus = async (teamId, completionDate, playerAssignments) => {
     try {
-        // Check if team completed a task on all weekdays this week
-        const startOfWeek = new Date(completionDate);
-        startOfWeek.setDate(startOfWeek.getDate() - startOfWeek.getDay() + 1); // Monday
-        startOfWeek.setHours(0, 0, 0, 0);
-        
-        const endOfWeek = new Date(startOfWeek);
-        endOfWeek.setDate(endOfWeek.getDate() + 4); // Friday
-        endOfWeek.setHours(23, 59, 59, 999);
-
-        // Count unique days with task completions this week
-        const completionDaysQuery = `
-            SELECT DISTINCT DATE(completed_at AT TIME ZONE 'UTC' AT TIME ZONE 'Australia/Sydney') as completion_day
-            FROM task_completions
-            WHERE team_id = $1
-            AND completed_at >= $2
-            AND completed_at <= $3
-        `;
-        const result = await db.query(completionDaysQuery, [teamId, startOfWeek, endOfWeek]);
-        
-        // If team completed tasks on all 5 weekdays, award bonus
-        if (result.rows.length >= 5) {
-            // Award +0.01 attendance points (will convert to attribute when reaching 25)
-            const updateQuery = `
-                UPDATE team_players
-                SET attendance_points = attendance_points + 0.01,
-                    monthly_points_earned = monthly_points_earned + 0.01
-                WHERE team_id = $1
-            `;
-            await db.query(updateQuery, [teamId]);
-            
-            // Convert points to attributes if any player reached 25
-            await convertAttributePointsToAttributes(teamId);
+        if (!playerAssignments || playerAssignments.length === 0) {
+            return; // No players assigned, no bonus
         }
+
+        // Get unique player IDs from assignments
+        const assignedPlayerIds = [...new Set(playerAssignments.map(a => a.playerId))];
+
+        if (assignedPlayerIds.length === 0) {
+            return; // No valid player IDs
+        }
+
+        // Award +2 attendance_points to each assigned player
+        const updateQuery = `
+            UPDATE team_players
+            SET attendance_points = attendance_points + 2,
+                monthly_points_earned = monthly_points_earned + 2
+            WHERE team_id = $1
+            AND player_id = ANY($2::int[])
+        `;
+        await db.query(updateQuery, [teamId, assignedPlayerIds]);
+
+        console.log(`Awarded +2 attendance_points to ${assignedPlayerIds.length} players assigned to task on team ${teamId}`);
+
+        // Convert points to attributes if any player reached 25
+        await convertAttributePointsToAttributes(teamId);
     } catch (error) {
         console.error('Error awarding attendance bonus:', error);
+        throw error;
     }
 };
 
@@ -116,8 +104,7 @@ const awardSocialBonus = async (taskCompletionId, playerId, teamId) => {
 };
 
 /**
- * Award productivity achievement: +0.01 productivity for a player
- * being used in 2 or more tasks within a day
+ * Award productivity bonus: +2 productivity_points if a player is used in 2+ tasks in one day
  */
 const awardProductivityBonus = async (playerId, teamId, completionDate) => {
     try {
@@ -139,21 +126,24 @@ const awardProductivityBonus = async (playerId, teamId, completionDate) => {
         const result = await db.query(tasksTodayQuery, [playerId, teamId, startOfDay, endOfDay]);
         const taskCount = parseInt(result.rows[0].task_count) || 0;
 
-        // If used in 2 or more tasks today, award bonus
+        // If used in 2 or more tasks today, award +2 productivity_points
         if (taskCount >= 2) {
             const updateQuery = `
                 UPDATE team_players
-                SET productivity_points = productivity_points + 0.01,
-                    monthly_points_earned = monthly_points_earned + 0.01
+                SET productivity_points = productivity_points + 2,
+                    monthly_points_earned = monthly_points_earned + 2
                 WHERE player_id = $1 AND team_id = $2
             `;
             await db.query(updateQuery, [playerId, teamId]);
+            
+            console.log(`Awarded +2 productivity_points to player ${playerId} for being used in ${taskCount} tasks today`);
             
             // Convert points to attributes if player reached 25
             await convertAttributePointsToAttributes(teamId);
         }
     } catch (error) {
         console.error('Error awarding productivity bonus:', error);
+        throw error;
     }
 };
 
@@ -643,12 +633,98 @@ const awardTaskProductivityBonus = async (teamId, bonusPoints, playerAssignments
 };
 
 /**
+ * Award intensity points to Office role players when completing an Office task
+ * Office positions: CS, CC, PR
+ * @param {number} teamId - Team ID
+ * @param {Array} playerAssignments - Array of { playerId, taskItemId, points }
+ */
+const awardOfficeTaskIntensityBonus = async (teamId, playerAssignments) => {
+    try {
+        if (!playerAssignments || playerAssignments.length === 0) {
+            return; // No players assigned, no bonus
+        }
+
+        // Get unique player IDs from assignments
+        const assignedPlayerIds = [...new Set(playerAssignments.map(a => a.playerId))];
+
+        if (assignedPlayerIds.length === 0) {
+            return; // No valid player IDs
+        }
+
+        // Office positions: CS, CC, PR
+        const officePositions = ['CS', 'CC', 'PR'];
+
+        // Award +1 intensity_points to assigned players with Office positions
+        const updateQuery = `
+            UPDATE team_players
+            SET intensity_points = intensity_points + 1,
+                monthly_points_earned = monthly_points_earned + 1
+            WHERE team_id = $1
+            AND player_id = ANY($2::int[])
+            AND position = ANY($3::text[])
+        `;
+        await db.query(updateQuery, [teamId, assignedPlayerIds, officePositions]);
+
+        console.log(`Awarded +1 intensity_points to Office role players assigned to Office task on team ${teamId}`);
+
+        // Convert points to attributes if any player reached 25
+        await convertAttributePointsToAttributes(teamId);
+    } catch (error) {
+        console.error('Error awarding office task intensity bonus:', error);
+        throw error;
+    }
+};
+
+/**
+ * Award intensity points to Warehouse role players when completing a Warehouse task
+ * Warehouse positions: PI, PA
+ * @param {number} teamId - Team ID
+ * @param {Array} playerAssignments - Array of { playerId, taskItemId, points }
+ */
+const awardWarehouseTaskIntensityBonus = async (teamId, playerAssignments) => {
+    try {
+        if (!playerAssignments || playerAssignments.length === 0) {
+            return; // No players assigned, no bonus
+        }
+
+        // Get unique player IDs from assignments
+        const assignedPlayerIds = [...new Set(playerAssignments.map(a => a.playerId))];
+
+        if (assignedPlayerIds.length === 0) {
+            return; // No valid player IDs
+        }
+
+        // Warehouse positions: PI, PA
+        const warehousePositions = ['PI', 'PA'];
+
+        // Award +1 intensity_points to assigned players with Warehouse positions
+        const updateQuery = `
+            UPDATE team_players
+            SET intensity_points = intensity_points + 1,
+                monthly_points_earned = monthly_points_earned + 1
+            WHERE team_id = $1
+            AND player_id = ANY($2::int[])
+            AND position = ANY($3::text[])
+        `;
+        await db.query(updateQuery, [teamId, assignedPlayerIds, warehousePositions]);
+
+        console.log(`Awarded +1 intensity_points to Warehouse role players assigned to Warehouse task on team ${teamId}`);
+
+        // Convert points to attributes if any player reached 25
+        await convertAttributePointsToAttributes(teamId);
+    } catch (error) {
+        console.error('Error awarding warehouse task intensity bonus:', error);
+        throw error;
+    }
+};
+
+/**
  * Process all point bonuses for a task completion
  */
 const processPointBonuses = async (taskCompletionId, teamId, completionDate, playerAssignments) => {
     try {
-        // Award attendance bonus (team-wide)
-        await awardAttendanceBonus(teamId, completionDate);
+        // Award attendance bonus: +2 attendance_points for each player assigned to a task within the day
+        await awardAttendanceBonus(teamId, completionDate, playerAssignments);
 
         // Process bonuses for each player assignment
         for (const assignment of playerAssignments) {
@@ -657,10 +733,10 @@ const processPointBonuses = async (taskCompletionId, teamId, completionDate, pla
             // Social bonus
             await awardSocialBonus(taskCompletionId, playerId, teamId);
             
-            // Productivity bonus
+            // Productivity bonus: +2 productivity_points if player is used in 2+ tasks in one day
             await awardProductivityBonus(playerId, teamId, completionDate);
             
-            // Intensity bonus
+            // Intensity bonus: +10 intensity_points if player is used in 5+ tasks in one day
             await awardIntensityBonus(playerId, teamId, completionDate);
             
             // Specialist bonus
@@ -677,6 +753,8 @@ module.exports = {
     awardAttributePoints,
     awardSpecialtyPoints,
     awardTaskProductivityBonus,
+    awardOfficeTaskIntensityBonus,
+    awardWarehouseTaskIntensityBonus,
     convertAttributePointsToAttributes,
     awardAttendanceBonus,
     awardSocialBonus,

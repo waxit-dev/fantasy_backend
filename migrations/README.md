@@ -117,3 +117,96 @@ psql $DATABASE_URL -f migrations/add_monthly_points_tracking.sql
 - Adds `last_monthly_reset` timestamp to track when points were last reset
 - Adds attribute-specific point tracking columns (attendance_points, social_points, productivity_points, intensity_points, specialist_points)
 - These columns track raw points earned for each attribute before conversion to attribute values
+
+---
+
+## Migration: Add purchase_date column
+
+### File: `add_purchase_date.sql`
+
+This migration adds a `purchase_date` column to track when players were purchased, enabling contract cooldown enforcement.
+
+### How to run:
+
+```bash
+psql $DATABASE_URL -f migrations/add_purchase_date.sql
+```
+
+### What it does:
+
+- Adds `purchase_date` column of type `TIMESTAMP WITH TIME ZONE` to `team_players` table
+- Sets default value to `NOW()` for all existing records
+- This date is used to enforce a 6-week (42 day) cooldown period before players can be sold
+- After the cooldown, teams can sell players at current market value to profit from development
+
+---
+
+## Migration: Add task_disputes and task_dispute_resolutions tables
+
+### File: `add_task_disputes.sql`
+
+This migration creates tables to track disputes on task completions and their resolutions.
+
+### How to run:
+
+```bash
+psql $DATABASE_URL -f migrations/add_task_disputes.sql
+```
+
+### What it does:
+
+- Creates `task_disputes` table to track which teams dispute which task completions
+- Prevents duplicate disputes from the same team using a UNIQUE constraint
+- Creates `task_dispute_resolutions` table to track when penalties are applied
+- When 3 or more teams dispute a task completion, the team that completed it is fined $15,000 and loses 50 total points
+- Includes indexes for efficient queries by task completion and team
+
+---
+
+## Migration: Add seasons table
+
+### File: `add_seasons.sql`
+
+This migration creates a table to track seasons, their dates, and winners.
+
+### How to run:
+
+```bash
+psql $DATABASE_URL -f migrations/add_seasons.sql
+```
+
+### What it does:
+
+- Creates `seasons` table to track seasons, their start/end dates, and winners
+- Pre-inserts 4 seasons:
+  - Season 1: Jan 23, 2026 - Apr 23, 2026
+  - Season 2: Apr 23, 2026 - Jul 23, 2026
+  - Season 3: Jul 23, 2026 - Oct 23, 2026
+  - Season 4: Oct 23, 2026 - Dec 18, 2026
+- Tracks winner team ID, name, and leaderboard score when season ends
+- Includes status field ('active', 'completed', 'pending')
+- Includes indexes for efficient queries by status and dates
+
+---
+
+## Migration: Add season features (snapshots, rewards, notifications)
+
+### File: `add_season_features.sql`
+
+This migration extends the seasons functionality with additional features for snapshots, rewards, and notifications.
+
+### How to run:
+
+```bash
+psql $DATABASE_URL -f migrations/add_season_features.sql
+```
+
+### What it does:
+
+- Creates `season_snapshots` table to store leaderboard positions at season end
+- Adds reward columns to `seasons` table (winner_reward_cash, winner_reward_points, rewards_distributed)
+- Creates `season_notifications` table for global season-related notifications
+- Creates `team_notifications` table for team-specific notifications
+- Creates `season_archives` table for optional data archiving
+- Includes indexes for efficient queries on all new tables
+- Default rewards: $50,000 cash and 1,000 points for season winners
