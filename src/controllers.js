@@ -2,6 +2,7 @@ const db = require('./db');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const { updatePlayerOverallRating, calculatePlayerSalary, calculateTeamScore } = require('./playerCalculations');
+const { getPlayerValuation, getPlayerTransactionHistory, getMarketAnalytics } = require('./playerValuation');
 
 
 // Controllers
@@ -53,6 +54,11 @@ const updatePlayerAttributeByPosition = async (req, res) => {
 
             // Recalculate overall rating using new formula (mean of 5 attributes, capped at 99)
             await updatePlayerOverallRating(player.player_id, player.team_id);
+            
+            // Update player attributes in players table to average across all teams
+            const { updatePlayerAttributesFromTeams, calculatePlayerSalary } = require('./playerCalculations');
+            await updatePlayerAttributesFromTeams(player.player_id);
+            await calculatePlayerSalary(player.player_id);
         });
 
         await Promise.all(updatePromises);
@@ -133,7 +139,8 @@ const getTeamById = async (req, res) => {
         // Get all players associated with the team
         const teamPlayersQuery = `
             SELECT players.id, players.name, players.salary, team_players.position, team_players.attendance, team_players.social,
-                   team_players.productivity, team_players.intensity, team_players.specialty_rating, team_players.overall_rating
+                   team_players.productivity, team_players.intensity, team_players.specialty_rating, team_players.overall_rating,
+                   team_players.purchase_date
             FROM players
             INNER JOIN team_players ON players.id = team_players.player_id
             WHERE team_players.team_id = $1
@@ -212,8 +219,8 @@ const purchasePlayer = async (req, res) => {
 
         // Insert the player into the team_players table with all related metrics
         const insertPlayerQuery = `
-            INSERT INTO team_players (team_id, player_id, position, attendance, social, productivity, intensity, specialty_rating, overall_rating)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+            INSERT INTO team_players (team_id, player_id, position, attendance, social, productivity, intensity, specialty_rating, overall_rating, purchase_price, purchase_date)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, NOW())
         `;
         await db.query(insertPlayerQuery, [
             teamId,               // $1 -> team_id
@@ -224,8 +231,25 @@ const purchasePlayer = async (req, res) => {
             player.productivity,  // $6 -> productivity
             player.intensity,     // $7 -> intensity
             player.specialty_rating, // $8 -> specialty_rating
-            player.overall_rating // $9 -> overall_rating
+            player.overall_rating, // $9 -> overall_rating
+            playerSalary          // $10 -> purchase_price (what team paid)
         ]);
+
+        // Record purchase transaction
+        const insertTransactionQuery = `
+            INSERT INTO player_transactions (player_id, team_id, transaction_type, price)
+            VALUES ($1, $2, 'purchase', $3)
+        `;
+        await db.query(insertTransactionQuery, [playerId, teamId, playerSalary]);
+
+        // Increase player's base salary by $10,000 for future purchases
+        const { increasePlayerBaseSalary } = require('./playerCalculations');
+        await increasePlayerBaseSalary(playerId);
+        console.log(`Player ${playerId} base salary increased by $10,000`);
+
+        // Update player attributes in players table to average across all teams
+        const { updatePlayerAttributesFromTeams } = require('./playerCalculations');
+        await updatePlayerAttributesFromTeams(playerId);
 
         // Recalculate player's salary using dynamic formula (base + demand + performance)
         const newPlayerSalary = await calculatePlayerSalary(playerId);
@@ -241,8 +265,9 @@ const purchasePlayer = async (req, res) => {
 
         // Get all players associated with the team
         const teamPlayersQuery = `
-            SELECT players.id, players.name, team_players.position, team_players.attendance, team_players.social,
-                   team_players.productivity, team_players.intensity, team_players.specialty_rating, team_players.overall_rating
+            SELECT players.id, players.name, players.salary, team_players.position, team_players.attendance, team_players.social,
+                   team_players.productivity, team_players.intensity, team_players.specialty_rating, team_players.overall_rating,
+                   team_players.purchase_date
             FROM players
             INNER JOIN team_players ON players.id = team_players.player_id
             WHERE team_players.team_id = $1
@@ -290,7 +315,8 @@ const sellPlayer = async (req, res) => {
 
         // Check if the player is actually on the team
         const checkTeamPlayerQuery = `
-            SELECT * FROM team_players 
+            SELECT *, purchase_date 
+            FROM team_players 
             WHERE team_id = $1 AND player_id = $2
         `;
         const teamPlayerResult = await db.query(checkTeamPlayerQuery, [teamId, playerId]);
@@ -299,14 +325,49 @@ const sellPlayer = async (req, res) => {
             return res.status(400).json({ message: 'Player is not on this team' });
         }
 
+        const teamPlayer = teamPlayerResult.rows[0];
+        const purchaseDate = new Date(teamPlayer.purchase_date);
+        const now = new Date();
+        
+        // Calculate days since purchase
+        const daysSincePurchase = Math.floor((now - purchaseDate) / (1000 * 60 * 60 * 24));
+        const cooldownDays = 42; // 6 weeks = 42 days
+        
+        // Check if cooldown period has passed
+        if (daysSincePurchase < cooldownDays) {
+            const daysRemaining = cooldownDays - daysSincePurchase;
+            return res.status(400).json({ 
+                message: `Player cannot be sold yet. Contract cooldown: ${daysRemaining} days remaining (6 weeks from purchase date).`,
+                daysRemaining: daysRemaining,
+                purchaseDate: purchaseDate,
+                cooldownDays: cooldownDays
+            });
+        }
+
         // Parse cash and salary to numbers
         const teamCash = parseFloat(team.cash) || 0;
         const playerSalary = parseFloat(player.salary) || 0;
+        
+        // Get purchase price (what team originally paid)
+        const purchasePrice = parseFloat(teamPlayer.purchase_price) || 0;
+        
+        // After cooldown, teams can sell at current market value (they've earned it through development)
+        const salePrice = playerSalary;
+        
+        // Calculate profit/loss
+        const profitLoss = salePrice - purchasePrice;
 
-        // Add player's salary back to team's cash
-        const newCashBalance = teamCash + playerSalary;
+        // Add player's current market value back to team's cash (after cooldown period)
+        const newCashBalance = teamCash + salePrice;
         const updateTeamCashQuery = `UPDATE teams SET cash = $1 WHERE id = $2`;
         await db.query(updateTeamCashQuery, [newCashBalance, teamId]);
+
+        // Record sale transaction
+        const insertTransactionQuery = `
+            INSERT INTO player_transactions (player_id, team_id, transaction_type, price)
+            VALUES ($1, $2, 'sale', $3)
+        `;
+        await db.query(insertTransactionQuery, [playerId, teamId, salePrice]);
 
         // Remove the player from the team_players table
         const deleteTeamPlayerQuery = `
@@ -315,7 +376,11 @@ const sellPlayer = async (req, res) => {
         `;
         await db.query(deleteTeamPlayerQuery, [teamId, playerId]);
         
-        // Recalculate player's salary (demand will decrease)
+        // Update player attributes in players table to average across remaining teams
+        const { updatePlayerAttributesFromTeams } = require('./playerCalculations');
+        await updatePlayerAttributesFromTeams(playerId);
+        
+        // Recalculate player's salary (demand will decrease, attributes may change)
         await calculatePlayerSalary(playerId);
         
         // Update team score after sale
@@ -328,8 +393,9 @@ const sellPlayer = async (req, res) => {
 
         // Get all players associated with the team
         const teamPlayersQuery = `
-            SELECT players.id, players.name, team_players.position, team_players.attendance, team_players.social,
-                   team_players.productivity, team_players.intensity, team_players.specialty_rating, team_players.overall_rating
+            SELECT players.id, players.name, players.salary, team_players.position, team_players.attendance, team_players.social,
+                   team_players.productivity, team_players.intensity, team_players.specialty_rating, team_players.overall_rating,
+                   team_players.purchase_date
             FROM players
             INNER JOIN team_players ON players.id = team_players.player_id
             WHERE team_players.team_id = $1
@@ -337,11 +403,15 @@ const sellPlayer = async (req, res) => {
         const teamPlayersResult = await db.query(teamPlayersQuery, [teamId]);
         const teamPlayers = teamPlayersResult.rows;
 
-        // Respond with the updated team and associated players
+        // Respond with the updated team, associated players, and sale info
         res.status(200).json({
             message: 'Player sold successfully',
             userTeam: updatedTeam,
-            teamPlayers: teamPlayers
+            teamPlayers: teamPlayers,
+            profitLoss: profitLoss,
+            purchasePrice: purchasePrice,
+            salePrice: salePrice,
+            daysOwned: daysSincePurchase
         });
     } catch (error) {
         console.error('Error selling player:', error);
@@ -468,25 +538,32 @@ const updateTeamTaskPoints = async (req, res) => {
         const currentTaskPoints = parseFloat(team.task_points || 0);
         const currentTotalPoints = parseFloat(team.total_points || 0);
         const currentWeeklyPoints = parseFloat(team.weekly_points || 0);
+        const currentCash = parseFloat(team.cash || 0);
 
         // Calculate new point values
         const newTaskPoints = currentTaskPoints + points;
         const newTotalPoints = currentTotalPoints + points;
         const newWeeklyPoints = currentWeeklyPoints + points;
+        
+        // Award $1000 cash for completing the task
+        const taskCompletionReward = 1000;
+        const newCash = currentCash + taskCompletionReward;
 
-        // Update team points in the database
+        // Update team points and cash in the database
         const updateTeamQuery = `
             UPDATE teams 
             SET task_points = $1::numeric, 
                 total_points = $2::numeric, 
-                weekly_points = $3::numeric
-            WHERE id = $4
+                weekly_points = $3::numeric,
+                cash = $4::numeric
+            WHERE id = $5
             RETURNING id, name, slug, cash, total_points, weekly_points, task_points
         `;
         const updateResult = await db.query(updateTeamQuery, [
             newTaskPoints,
             newTotalPoints,
             newWeeklyPoints,
+            newCash,
             id
         ]);
 
@@ -595,10 +672,10 @@ const completeTaskWithPlayers = async (req, res) => {
             await awardSpecialtyPoints(id, taskItems, taskCompletionId);
         }
 
-        // Award overall task productivity bonus if specified
+        // Award overall task productivity bonus if specified (only to players assigned to items)
         if (taskProductivityBonus && taskProductivityBonus > 0) {
             const { awardTaskProductivityBonus } = require('./pointEarningSystem');
-            await awardTaskProductivityBonus(id, taskProductivityBonus);
+            await awardTaskProductivityBonus(id, taskProductivityBonus, playerAssignments || []);
         }
 
         // Process point bonuses (attendance, social, productivity, intensity, specialist)
@@ -610,28 +687,35 @@ const completeTaskWithPlayers = async (req, res) => {
             playerAssignments || []
         );
 
-        // Update team points
+        // Update team points and award cash
         const team = teamResult.rows[0];
         const currentTaskPoints = parseFloat(team.task_points || 0);
         const currentTotalPoints = parseFloat(team.total_points || 0);
         const currentWeeklyPoints = parseFloat(team.weekly_points || 0);
+        const currentCash = parseFloat(team.cash || 0);
 
         const newTaskPoints = currentTaskPoints + points;
         const newTotalPoints = currentTotalPoints + points;
         const newWeeklyPoints = currentWeeklyPoints + points;
+        
+        // Award $1000 cash for completing the task
+        const taskCompletionReward = 1000;
+        const newCash = currentCash + taskCompletionReward;
 
         const updateTeamQuery = `
             UPDATE teams 
             SET task_points = $1::numeric, 
                 total_points = $2::numeric, 
-                weekly_points = $3::numeric
-            WHERE id = $4
+                weekly_points = $3::numeric,
+                cash = $4::numeric
+            WHERE id = $5
             RETURNING id, name, slug, cash, total_points, weekly_points, task_points
         `;
         const updateResult = await db.query(updateTeamQuery, [
             newTaskPoints,
             newTotalPoints,
             newWeeklyPoints,
+            newCash,
             id
         ]);
 
@@ -650,6 +734,420 @@ const completeTaskWithPlayers = async (req, res) => {
     }
 };
 
+const convertPlayerAttributePoints = async (req, res) => {
+    const { id } = req.params; // Team ID
+
+    try {
+        const { convertAttributePointsToAttributes } = require('./pointEarningSystem');
+        await convertAttributePointsToAttributes(id);
+
+        res.status(200).json({
+            message: 'Attribute points converted successfully'
+        });
+    } catch (error) {
+        console.error('Error converting attribute points:', error);
+        res.status(500).json({ message: 'Error converting attribute points' });
+    }
+};
+
+// Player valuation and analytics endpoints
+const getPlayerValuationById = async (req, res) => {
+    const { id } = req.params;
+    
+    try {
+        const valuation = await getPlayerValuation(id);
+        if (!valuation) {
+            return res.status(404).json({ message: 'Player not found' });
+        }
+        res.status(200).json(valuation);
+    } catch (error) {
+        console.error('Error getting player valuation:', error);
+        res.status(500).json({ message: 'Error getting player valuation' });
+    }
+};
+
+const getPlayerTransactions = async (req, res) => {
+    const { id } = req.params; // playerId
+    const { teamId } = req.query; // optional teamId filter
+    
+    try {
+        const transactions = await getPlayerTransactionHistory(id, teamId ? parseInt(teamId) : null);
+        res.status(200).json(transactions);
+    } catch (error) {
+        console.error('Error getting player transactions:', error);
+        res.status(500).json({ message: 'Error getting player transactions' });
+    }
+};
+
+const getMarketAnalyticsData = async (req, res) => {
+    try {
+        const analytics = await getMarketAnalytics();
+        res.status(200).json(analytics);
+    } catch (error) {
+        console.error('Error getting market analytics:', error);
+        res.status(500).json({ message: 'Error getting market analytics' });
+    }
+};
+
+// Task name mapping (can be enhanced to read from taskConfig or database)
+const getTaskName = (taskId) => {
+    const taskNames = {
+        'add-product': 'Add a product to the store',
+        // Add more task mappings as tasks are created
+    };
+    // If not found in mapping, return a formatted version of the task ID
+    return taskNames[taskId] || taskId.split('-').map(word => 
+        word.charAt(0).toUpperCase() + word.slice(1)
+    ).join(' ');
+};
+
+const getTaskLogs = async (req, res) => {
+    try {
+        // Get all task completions with team information
+        const logsQuery = `
+            SELECT 
+                tc.id,
+                tc.task_id,
+                tc.team_id,
+                tc.completed_at,
+                tc.points_awarded,
+                t.name as team_name,
+                t.slug as team_slug
+            FROM task_completions tc
+            INNER JOIN teams t ON tc.team_id = t.id
+            ORDER BY tc.completed_at DESC
+        `;
+        const logsResult = await db.query(logsQuery);
+        
+        // Get delegations for each task completion (if table exists)
+        const completionIds = logsResult.rows.map(row => row.id);
+        let delegationsMap = {};
+        
+        if (completionIds.length > 0) {
+            try {
+                const delegationsQuery = `
+                    SELECT 
+                        td.task_completion_id,
+                        td.delegated_team_id,
+                        td.delegating_team_id,
+                        td.points_awarded as delegation_points,
+                        t1.name as delegated_team_name,
+                        t1.slug as delegated_team_slug,
+                        t2.name as delegating_team_name,
+                        t2.slug as delegating_team_slug
+                    FROM task_delegations td
+                    INNER JOIN teams t1 ON td.delegated_team_id = t1.id
+                    INNER JOIN teams t2 ON td.delegating_team_id = t2.id
+                    WHERE td.task_completion_id = ANY($1::int[])
+                `;
+                const delegationsResult = await db.query(delegationsQuery, [completionIds]);
+                
+                // Group delegations by task_completion_id
+                delegationsResult.rows.forEach(delegation => {
+                    if (!delegationsMap[delegation.task_completion_id]) {
+                        delegationsMap[delegation.task_completion_id] = [];
+                    }
+                    delegationsMap[delegation.task_completion_id].push({
+                        delegatedTeamId: delegation.delegated_team_id,
+                        delegatedTeamName: delegation.delegated_team_name,
+                        delegatedTeamSlug: delegation.delegated_team_slug,
+                        delegatingTeamId: delegation.delegating_team_id,
+                        delegatingTeamName: delegation.delegating_team_name,
+                        delegatingTeamSlug: delegation.delegating_team_slug,
+                        pointsAwarded: parseFloat(delegation.delegation_points) || 0
+                    });
+                });
+            } catch (error) {
+                // If task_delegations table doesn't exist yet, just continue without delegations
+                console.log('Task delegations table not found or error querying delegations:', error.message);
+            }
+        }
+        
+        // Get dispute counts and disputing teams for each completion
+        let disputesMap = {};
+        let resolvedMap = {};
+        let disputingTeamsMap = {};
+
+        if (completionIds.length > 0) {
+            try {
+                // Get dispute counts and disputing team IDs
+                const disputesQuery = `
+                    SELECT 
+                        task_completion_id,
+                        disputing_team_id,
+                        COUNT(*) OVER (PARTITION BY task_completion_id) as dispute_count
+                    FROM task_disputes
+                    WHERE task_completion_id = ANY($1::int[])
+                `;
+                const disputesResult = await db.query(disputesQuery, [completionIds]);
+                disputesResult.rows.forEach(row => {
+                    const completionId = row.task_completion_id;
+                    if (!disputesMap[completionId]) {
+                        disputesMap[completionId] = parseInt(row.dispute_count) || 0;
+                        disputingTeamsMap[completionId] = [];
+                    }
+                    disputingTeamsMap[completionId].push(parseInt(row.disputing_team_id));
+                });
+
+                // Get resolved disputes
+                const resolvedQuery = `
+                    SELECT task_completion_id 
+                    FROM task_dispute_resolutions 
+                    WHERE task_completion_id = ANY($1::int[])
+                `;
+                const resolvedResult = await db.query(resolvedQuery, [completionIds]);
+                resolvedResult.rows.forEach(row => {
+                    resolvedMap[row.task_completion_id] = true;
+                });
+            } catch (error) {
+                console.log('Error querying disputes:', error.message);
+            }
+        }
+        
+        // Format the response
+        const logs = logsResult.rows.map(log => ({
+            id: log.id,
+            taskId: log.task_id,
+            taskName: getTaskName(log.task_id),
+            teamId: log.team_id,
+            teamName: log.team_name,
+            teamSlug: log.team_slug,
+            completedAt: log.completed_at,
+            pointsAwarded: parseFloat(log.points_awarded) || 0,
+            delegations: delegationsMap[log.id] || [],
+            disputeCount: disputesMap[log.id] || 0,
+            isResolved: resolvedMap[log.id] || false,
+            disputingTeamIds: disputingTeamsMap[log.id] || []
+        }));
+        
+        res.status(200).json({
+            logs: logs,
+            total: logs.length
+        });
+    } catch (error) {
+        console.error('Error getting task logs:', error);
+        res.status(500).json({ message: 'Error retrieving task logs' });
+    }
+};
+
+const disputeTaskCompletion = async (req, res) => {
+    const { taskCompletionId } = req.body;
+    const { id: teamId } = req.params; // Team ID from URL params (disputing team)
+
+    try {
+        // Validate inputs
+        if (!taskCompletionId) {
+            return res.status(400).json({ message: 'Task completion ID is required' });
+        }
+
+        // Get task completion details
+        const taskCompletionQuery = `
+            SELECT tc.id, tc.team_id as completed_by_team_id, tc.task_id, tc.points_awarded
+            FROM task_completions tc
+            WHERE tc.id = $1
+        `;
+        const taskCompletionResult = await db.query(taskCompletionQuery, [taskCompletionId]);
+
+        if (taskCompletionResult.rows.length === 0) {
+            return res.status(404).json({ message: 'Task completion not found' });
+        }
+
+        const taskCompletion = taskCompletionResult.rows[0];
+
+        // Prevent teams from disputing their own task completions
+        if (parseInt(taskCompletion.completed_by_team_id) === parseInt(teamId)) {
+            return res.status(400).json({ message: 'You cannot dispute your own task completion' });
+        }
+
+        // Check if team has already disputed this completion
+        const existingDisputeQuery = `
+            SELECT id FROM task_disputes 
+            WHERE task_completion_id = $1 AND disputing_team_id = $2
+        `;
+        const existingDisputeResult = await db.query(existingDisputeQuery, [taskCompletionId, teamId]);
+
+        if (existingDisputeResult.rows.length > 0) {
+            return res.status(400).json({ message: 'You have already disputed this task completion' });
+        }
+
+        // Check if this dispute has already been resolved (penalties applied)
+        const resolvedQuery = `
+            SELECT id FROM task_dispute_resolutions 
+            WHERE task_completion_id = $1
+        `;
+        const resolvedResult = await db.query(resolvedQuery, [taskCompletionId]);
+
+        if (resolvedResult.rows.length > 0) {
+            return res.status(400).json({ message: 'This dispute has already been resolved and penalties applied' });
+        }
+
+        // Create the dispute
+        const insertDisputeQuery = `
+            INSERT INTO task_disputes (task_completion_id, disputing_team_id)
+            VALUES ($1, $2)
+            RETURNING id
+        `;
+        await db.query(insertDisputeQuery, [taskCompletionId, teamId]);
+
+        // Count total disputes for this completion
+        const countDisputesQuery = `
+            SELECT COUNT(*) as dispute_count
+            FROM task_disputes
+            WHERE task_completion_id = $1
+        `;
+        const countResult = await db.query(countDisputesQuery, [taskCompletionId]);
+        const disputeCount = parseInt(countResult.rows[0].dispute_count);
+
+        let penaltiesApplied = false;
+
+        // If 3 or more teams dispute, apply penalties
+        if (disputeCount >= 3) {
+            const disputedTeamId = taskCompletion.completed_by_team_id;
+            const fineAmount = 15000;
+            const pointsPenalty = 50;
+
+            // Get current team data
+            const teamQuery = `SELECT * FROM teams WHERE id = $1`;
+            const teamResult = await db.query(teamQuery, [disputedTeamId]);
+
+            if (teamResult.rows.length === 0) {
+                return res.status(404).json({ message: 'Team that completed the task not found' });
+            }
+
+            const team = teamResult.rows[0];
+            const currentCash = parseFloat(team.cash || 0);
+            const currentTotalPoints = parseFloat(team.total_points || 0);
+            const currentTaskPoints = parseFloat(team.task_points || 0);
+
+            // Apply fine and point penalty
+            const newCash = Math.max(0, currentCash - fineAmount); // Don't go below 0
+            const newTotalPoints = Math.max(0, currentTotalPoints - pointsPenalty);
+            const newTaskPoints = Math.max(0, currentTaskPoints - pointsPenalty);
+
+            // Update team
+            const updateTeamQuery = `
+                UPDATE teams 
+                SET cash = $1::numeric,
+                    total_points = $2::numeric,
+                    task_points = $3::numeric
+                WHERE id = $4
+            `;
+            await db.query(updateTeamQuery, [newCash, newTotalPoints, newTaskPoints, disputedTeamId]);
+
+            // Record the resolution
+            const insertResolutionQuery = `
+                INSERT INTO task_dispute_resolutions 
+                (task_completion_id, disputed_team_id, dispute_count, fine_amount, points_penalty)
+                VALUES ($1, $2, $3, $4, $5)
+            `;
+            await db.query(insertResolutionQuery, [
+                taskCompletionId,
+                disputedTeamId,
+                disputeCount,
+                fineAmount,
+                pointsPenalty
+            ]);
+
+            // Recalculate team score
+            await calculateTeamScore(disputedTeamId);
+
+            penaltiesApplied = true;
+        }
+
+        res.status(200).json({
+            message: 'Dispute recorded successfully',
+            disputeCount: disputeCount,
+            penaltiesApplied: penaltiesApplied,
+            ...(penaltiesApplied && {
+                fineAmount: 15000,
+                pointsPenalty: 50,
+                message: 'Dispute recorded. Penalties have been applied to the team that completed this task.'
+            })
+        });
+    } catch (error) {
+        console.error('Error disputing task completion:', error);
+        res.status(500).json({ message: 'Error processing dispute' });
+    }
+};
+
+const getTaskDisputes = async (req, res) => {
+    const { taskCompletionId } = req.params;
+
+    try {
+        // Get all disputes for this task completion
+        const disputesQuery = `
+            SELECT 
+                td.id,
+                td.disputing_team_id,
+                td.created_at,
+                t.name as disputing_team_name,
+                t.slug as disputing_team_slug
+            FROM task_disputes td
+            INNER JOIN teams t ON td.disputing_team_id = t.id
+            WHERE td.task_completion_id = $1
+            ORDER BY td.created_at ASC
+        `;
+        const disputesResult = await db.query(disputesQuery, [taskCompletionId]);
+
+        // Check if resolved
+        const resolvedQuery = `
+            SELECT * FROM task_dispute_resolutions 
+            WHERE task_completion_id = $1
+        `;
+        const resolvedResult = await db.query(resolvedQuery, [taskCompletionId]);
+
+        res.status(200).json({
+            disputes: disputesResult.rows.map(dispute => ({
+                id: dispute.id,
+                disputingTeamId: dispute.disputing_team_id,
+                disputingTeamName: dispute.disputing_team_name,
+                disputingTeamSlug: dispute.disputing_team_slug,
+                createdAt: dispute.created_at
+            })),
+            disputeCount: disputesResult.rows.length,
+            resolved: resolvedResult.rows.length > 0,
+            resolution: resolvedResult.rows.length > 0 ? {
+                fineAmount: parseFloat(resolvedResult.rows[0].fine_amount) || 0,
+                pointsPenalty: parseInt(resolvedResult.rows[0].points_penalty) || 0,
+                resolvedAt: resolvedResult.rows[0].resolved_at
+            } : null
+        });
+    } catch (error) {
+        console.error('Error getting task disputes:', error);
+        res.status(500).json({ message: 'Error retrieving disputes' });
+    }
+};
+
+// Utility endpoint to sync all player attributes from team_players to players table
+const syncAllPlayerAttributes = async (req, res) => {
+    try {
+        const { updatePlayerAttributesFromTeams, calculatePlayerSalary, recalculateAllPlayerOverallRatings } = require('./playerCalculations');
+        
+        // Get all unique player IDs from team_players
+        const playersQuery = `SELECT DISTINCT player_id FROM team_players`;
+        const playersResult = await db.query(playersQuery);
+        
+        const syncPromises = playersResult.rows.map(async (row) => {
+            const playerId = row.player_id;
+            await updatePlayerAttributesFromTeams(playerId);
+            await calculatePlayerSalary(playerId);
+        });
+        
+        await Promise.all(syncPromises);
+        
+        // Also recalculate overall_rating for ALL players (including those not in any team)
+        const recalculatedCount = await recalculateAllPlayerOverallRatings();
+        
+        res.status(200).json({ 
+            message: `Successfully synced attributes for ${playersResult.rows.length} players and recalculated overall_rating for all players`,
+            playersSynced: playersResult.rows.length,
+            overallRatingsRecalculated: recalculatedCount
+        });
+    } catch (error) {
+        console.error('Error syncing player attributes:', error);
+        res.status(500).json({ message: 'Error syncing player attributes' });
+    }
+};
 
 module.exports = {
   getAllPlayers,
@@ -663,6 +1161,27 @@ module.exports = {
   sellPlayer,
   loginTeam,
   updateTeamTaskPoints,
-  completeTaskWithPlayers
+  completeTaskWithPlayers,
+  convertPlayerAttributePoints,
+  getPlayerValuationById,
+  getPlayerTransactions,
+  getMarketAnalyticsData,
+  getTaskLogs,
+  disputeTaskCompletion,
+  getTaskDisputes,
+  syncAllPlayerAttributes,
+  recalculateAllPlayerOverallRatings: async (req, res) => {
+    try {
+      const { recalculateAllPlayerOverallRatings } = require('./playerCalculations');
+      const count = await recalculateAllPlayerOverallRatings();
+      res.status(200).json({ 
+        message: `Successfully recalculated overall_rating for ${count} players`,
+        playersUpdated: count
+      });
+    } catch (error) {
+      console.error('Error recalculating overall ratings:', error);
+      res.status(500).json({ message: 'Error recalculating overall ratings' });
+    }
+  }
 };
 

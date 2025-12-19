@@ -368,11 +368,14 @@ const awardAttributePoints = async (teamId, taskItems, taskCompletionId) => {
 
 /**
  * Convert attribute points to attribute increases
- * When a player has 25+ points in an attribute, add 0.01 to that attribute
- * and subtract 25 from the points counter
+ * - When a player has 25+ points in attendance/social/productivity/intensity, add 1 to that attribute (integer)
+ * - When a player has 10+ points in specialist_points, add 1 to specialty_rating (integer)
+ * Subtracts the converted amount from the points counter
  */
 const convertAttributePointsToAttributes = async (teamId) => {
     try {
+        console.log(`[convertAttributePointsToAttributes] Starting conversion for team ${teamId}`);
+        
         // Get all players on the team with their current attribute points
         const playersQuery = `
             SELECT player_id, 
@@ -390,38 +393,50 @@ const convertAttributePointsToAttributes = async (teamId) => {
             WHERE team_id = $1
         `;
         const playersResult = await db.query(playersQuery, [teamId]);
+        
+        console.log(`[convertAttributePointsToAttributes] Found ${playersResult.rows.length} players on team ${teamId}`);
 
         for (const player of playersResult.rows) {
             const playerId = player.player_id;
             let needsUpdate = false;
             const updates = [];
 
-            // Check each attribute and convert points if >= 25 (specialty uses 10)
+            // Check each attribute and convert points to attribute increases
+            // Regular attributes: 25 points = +1 attribute (integer)
+            // Specialty: 10 points = +1 specialty_rating (integer)
             const attributes = [
-                { points: 'attendance_points', attr: 'attendance', currentAttr: 'attendance', threshold: 25 },
-                { points: 'social_points', attr: 'social', currentAttr: 'social', threshold: 25 },
-                { points: 'productivity_points', attr: 'productivity', currentAttr: 'productivity', threshold: 25 },
-                { points: 'intensity_points', attr: 'intensity', currentAttr: 'intensity', threshold: 25 },
-                { points: 'specialist_points', attr: 'specialty_rating', currentAttr: 'specialty_rating', threshold: 10 } // Specialty uses 10 points = 0.01
+                { points: 'attendance_points', attr: 'attendance', currentAttr: 'attendance', threshold: 25, increasePerConversion: 1 },
+                { points: 'social_points', attr: 'social', currentAttr: 'social', threshold: 25, increasePerConversion: 1 },
+                { points: 'productivity_points', attr: 'productivity', currentAttr: 'productivity', threshold: 25, increasePerConversion: 1 },
+                { points: 'intensity_points', attr: 'intensity', currentAttr: 'intensity', threshold: 25, increasePerConversion: 1 },
+                { points: 'specialist_points', attr: 'specialty_rating', currentAttr: 'specialty_rating', threshold: 10, increasePerConversion: 1 } // 10 specialist_points = +1 specialty_rating
             ];
 
-            for (const { points, attr, currentAttr, threshold } of attributes) {
+            for (const { points, attr, currentAttr, threshold, increasePerConversion } of attributes) {
                 const currentPoints = parseFloat(player[points]) || 0;
+                
+                console.log(`[convertAttributePointsToAttributes] Player ${playerId}: Checking ${points} = ${currentPoints} (threshold: ${threshold})`);
                 
                 if (currentPoints >= threshold) {
                     // Calculate how many full conversions
                     const conversions = Math.floor(currentPoints / threshold);
-                    const attributeIncrease = conversions * 0.01;
+                    const attributeIncrease = conversions * increasePerConversion;
                     const remainingPoints = currentPoints - (conversions * threshold);
 
                     // Update attribute (capped at 99)
-                    const newAttributeValue = Math.min(99, parseFloat(player[currentAttr]) + attributeIncrease);
+                    const currentAttributeValue = parseFloat(player[currentAttr]) || 0;
+                    const newAttributeValue = Math.min(99, currentAttributeValue + attributeIncrease);
+                    
+                    // Round to integer since all attributes are integer columns
+                    const finalAttributeValue = Math.round(newAttributeValue);
+                    
+                    console.log(`[convertAttributePointsToAttributes] Converting ${points}: ${currentPoints} points -> ${conversions} conversions -> +${attributeIncrease} to ${currentAttr} (${currentAttributeValue} -> ${finalAttributeValue}), ${remainingPoints} remaining`);
                     
                     updates.push({
                         pointsColumn: points,
                         attributeColumn: currentAttr,
                         newPoints: remainingPoints,
-                        newAttribute: newAttributeValue
+                        newAttribute: finalAttributeValue
                     });
                     
                     needsUpdate = true;
@@ -436,25 +451,72 @@ const convertAttributePointsToAttributes = async (teamId) => {
                 let paramIndex = 1;
 
                 for (const update of updates) {
-                    updateParts.push(`${update.attributeColumn} = $${paramIndex}`);
-                    params.push(update.newAttribute);
+                    // Use proper column name mapping for safety
+                    let attributeCol, pointsCol;
+                    switch (update.attributeColumn) {
+                        case 'attendance':
+                            attributeCol = 'attendance';
+                            pointsCol = 'attendance_points';
+                            break;
+                        case 'social':
+                            attributeCol = 'social';
+                            pointsCol = 'social_points';
+                            break;
+                        case 'productivity':
+                            attributeCol = 'productivity';
+                            pointsCol = 'productivity_points';
+                            break;
+                        case 'intensity':
+                            attributeCol = 'intensity';
+                            pointsCol = 'intensity_points';
+                            break;
+                        case 'specialty_rating':
+                            attributeCol = 'specialty_rating';
+                            pointsCol = 'specialist_points';
+                            break;
+                        default:
+                            console.warn(`Unknown attribute column: ${update.attributeColumn}`);
+                            continue;
+                    }
+                    
+                    // Cast to INTEGER since all attributes are integer columns
+                    const attributeValue = Math.round(typeof update.newAttribute === 'number' ? update.newAttribute : parseFloat(update.newAttribute));
+                    const pointsValue = typeof update.newPoints === 'number' ? update.newPoints : parseFloat(update.newPoints);
+                    
+                    updateParts.push(`${attributeCol} = $${paramIndex}::INTEGER`);
+                    params.push(attributeValue);
                     paramIndex++;
                     
-                    updateParts.push(`${update.pointsColumn} = $${paramIndex}`);
-                    params.push(update.newPoints);
+                    updateParts.push(`${pointsCol} = $${paramIndex}::DECIMAL`);
+                    params.push(pointsValue);
                     paramIndex++;
                 }
 
-                updateQuery += updateParts.join(', ');
-                updateQuery += ` WHERE player_id = $${paramIndex} AND team_id = $${paramIndex + 1}`;
-                params.push(playerId, teamId);
+                if (updateParts.length > 0) {
+                    updateQuery += updateParts.join(', ');
+                    updateQuery += ` WHERE player_id = $${paramIndex}::INTEGER AND team_id = $${paramIndex + 1}::INTEGER`;
+                    params.push(parseInt(playerId), parseInt(teamId));
 
-                await db.query(updateQuery, params);
+                    console.log(`Executing conversion query for player ${playerId}:`, updateQuery, params);
+                    await db.query(updateQuery, params);
+                    console.log(`Successfully converted points for player ${playerId}`);
+                }
 
-                // Update overall rating and salary after attribute changes
+                // Update overall rating for this team instance
                 await updatePlayerOverallRating(playerId, teamId);
-                await calculatePlayerSalary(playerId);
             }
+        }
+        
+        // After all conversions, update player attributes in players table for ALL players on the team
+        // This ensures averages are calculated correctly even if a player didn't have conversions this time
+        const { updatePlayerAttributesFromTeams, calculatePlayerSalary } = require('./playerCalculations');
+        const allPlayersQuery = `SELECT DISTINCT player_id FROM team_players WHERE team_id = $1`;
+        const allPlayersResult = await db.query(allPlayersQuery, [teamId]);
+        
+        for (const row of allPlayersResult.rows) {
+            const playerId = row.player_id;
+            await updatePlayerAttributesFromTeams(playerId);
+            await calculatePlayerSalary(playerId);
         }
     } catch (error) {
         console.error('Error converting attribute points to attributes:', error);
@@ -546,18 +608,31 @@ const awardSpecialtyPoints = async (teamId, taskItems, taskCompletionId) => {
 };
 
 /**
- * Award overall task productivity bonus to all players on the team
+ * Award overall task productivity bonus to players assigned to at least one item in the task
+ * playerAssignments: Array of { playerId, taskItemId, points } - players assigned to task items
  */
-const awardTaskProductivityBonus = async (teamId, bonusPoints) => {
+const awardTaskProductivityBonus = async (teamId, bonusPoints, playerAssignments) => {
     try {
-        // Award productivity points to all players on the team
+        if (!playerAssignments || playerAssignments.length === 0) {
+            return; // No players assigned, no bonus
+        }
+
+        // Get unique player IDs from assignments
+        const assignedPlayerIds = [...new Set(playerAssignments.map(a => a.playerId))];
+
+        if (assignedPlayerIds.length === 0) {
+            return; // No valid player IDs
+        }
+
+        // Award productivity points only to assigned players
         const updateQuery = `
             UPDATE team_players
             SET productivity_points = productivity_points + $1,
                 monthly_points_earned = monthly_points_earned + $1
             WHERE team_id = $2
+            AND player_id = ANY($3::int[])
         `;
-        await db.query(updateQuery, [bonusPoints, teamId]);
+        await db.query(updateQuery, [bonusPoints, teamId, assignedPlayerIds]);
 
         // Convert points to attributes if any player reached 25
         await convertAttributePointsToAttributes(teamId);
